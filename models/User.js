@@ -1,6 +1,28 @@
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 
+// Company access sub-schema
+const companyAccessSchema = new mongoose.Schema({
+  company: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Company',
+    required: true
+  },
+  companySlug: {
+    type: String,
+    required: true
+  },
+  companyName: {
+    type: String,
+    required: true
+  },
+  role: {
+    type: String,
+    enum: ['admin', 'user'],
+    default: 'user'
+  }
+}, { _id: false });
+
 const userSchema = new mongoose.Schema({
   username: {
     type: String,
@@ -23,11 +45,19 @@ const userSchema = new mongoose.Schema({
     type: String,
     default: null
   },
+  // Legacy role field - kept for backward compatibility
   role: {
     type: String,
     enum: ['admin', 'user'],
     default: 'user'
   },
+  // Super admin can access all companies and create new ones
+  isSuperAdmin: {
+    type: Boolean,
+    default: false
+  },
+  // Array of companies user can access with role per company
+  companyAccess: [companyAccessSchema],
   createdAt: {
     type: Date,
     default: Date.now

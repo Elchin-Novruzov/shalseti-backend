@@ -30,9 +30,15 @@ async function seedDatabase() {
     await mongoose.connect(config.MONGODB_URI);
     console.log('Connected to MongoDB');
     
-    // Clear existing users (optional - comment out if you want to keep existing users)
-    await User.deleteMany({});
-    console.log('Cleared existing users');
+    // SAFETY CHECK: Only seed if no users exist (prevents accidental data loss)
+    const existingUserCount = await User.countDocuments();
+    if (existingUserCount > 0) {
+      console.log(`\n⚠️  Database already has ${existingUserCount} user(s). Seeding skipped to protect existing data.`);
+      console.log('If you need to reset users, manually delete them first.\n');
+      process.exit(0);
+    }
+    
+    console.log('No existing users found. Proceeding with seeding...');
     
     // Create mock users
     for (const userData of mockUsers) {

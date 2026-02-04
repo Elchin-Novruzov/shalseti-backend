@@ -5,6 +5,10 @@ const jwt = require('jsonwebtoken');
 const cron = require('node-cron');
 const config = require('./config');
 const User = require('./models/User');
+const Company = require('./models/Company');
+const { getCompanyConnection, getConnectionStatus } = require('./db-manager');
+
+// Legacy model imports (for backward compatibility during migration)
 const Scan = require('./models/Scan');
 const Product = require('./models/Product');
 const Category = require('./models/Category');
@@ -16,9 +20,20 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
-// Connect to MongoDB
-mongoose.connect(config.MONGODB_URI)
-  .then(() => console.log('Connected to MongoDB'))
+// Connect to MongoDB (master database for users and companies)
+function getMasterDbUri() {
+  let uri = config.MONGODB_URI;
+  const masterDb = config.MASTER_DB_NAME || 'shalset-master';
+  if (uri.includes('?')) {
+    uri = uri.replace('/?', '/' + masterDb + '?');
+  } else {
+    uri = uri.replace(/\/$/, '') + '/' + masterDb;
+  }
+  return uri;
+}
+
+mongoose.connect(getMasterDbUri())
+  .then(() => console.log('Connected to MongoDB (master database)'))
   .catch(err => console.error('MongoDB connection error:', err));
 
 // ============ AUTO CLEANUP SCHEDULER ============
@@ -72,10 +87,57 @@ const authMiddleware = async (req, res, next) => {
 
 // Admin middleware - requires admin role
 const adminMiddleware = async (req, res, next) => {
-  if (req.user.role !== 'admin') {
+  if (req.user.role !== 'admin' && !req.user.isSuperAdmin) {
     return res.status(403).json({ message: 'Admin access required' });
   }
   next();
+};
+
+// Super admin middleware - requires super admin role
+const superAdminMiddleware = async (req, res, next) => {
+  if (!req.user.isSuperAdmin) {
+    return res.status(403).json({ message: 'Super admin access required' });
+  }
+  next();
+};
+
+// Company middleware - validates and sets up company database connection
+const companyMiddleware = async (req, res, next) => {
+  try {
+    const companySlug = req.headers['x-company-slug'];
+    
+    // If no company header, use default (backward compatibility)
+    if (!companySlug) {
+      req.companySlug = config.DEFAULT_COMPANY_SLUG;
+    } else {
+      req.companySlug = companySlug;
+    }
+    
+    // Check if user has access to this company (unless super admin)
+    if (!req.user.isSuperAdmin) {
+      const hasAccess = req.user.companyAccess?.some(ca => ca.companySlug === req.companySlug);
+      // Also check legacy access (if user has no companyAccess set, allow default)
+      const legacyAccess = !req.user.companyAccess || req.user.companyAccess.length === 0;
+      
+      if (!hasAccess && !legacyAccess) {
+        return res.status(403).json({ message: 'No access to this company' });
+      }
+    }
+    
+    // Get company database connection
+    const companyDb = await getCompanyConnection(req.companySlug);
+    req.companyDb = companyDb;
+    
+    // Get models from company database
+    req.Product = companyDb.model('Product');
+    req.Category = companyDb.model('Category');
+    req.Scan = companyDb.model('Scan');
+    
+    next();
+  } catch (error) {
+    console.error('Company middleware error:', error);
+    res.status(500).json({ message: 'Failed to connect to company database' });
+  }
 };
 
 // Routes
@@ -108,6 +170,23 @@ app.post('/api/auth/login', async (req, res) => {
     // Generate token
     const token = generateToken(user._id);
     
+    // Get companies user can access
+    let companies = [];
+    if (user.isSuperAdmin) {
+      // Super admin can access all companies
+      companies = await Company.find({ isActive: true }).select('name slug logo color');
+    } else if (user.companyAccess && user.companyAccess.length > 0) {
+      // Get companies from user's access list
+      const companyIds = user.companyAccess.map(ca => ca.company);
+      companies = await Company.find({ _id: { $in: companyIds }, isActive: true }).select('name slug logo color');
+    } else {
+      // Legacy user without companyAccess - give access to default company
+      const defaultCompany = await Company.findOne({ slug: config.DEFAULT_COMPANY_SLUG });
+      if (defaultCompany) {
+        companies = [defaultCompany];
+      }
+    }
+    
     res.json({
       success: true,
       token,
@@ -115,7 +194,16 @@ app.post('/api/auth/login', async (req, res) => {
         id: user._id,
         username: user.username,
         fullName: user.fullName,
-        role: user.role
+        role: user.role,
+        isSuperAdmin: user.isSuperAdmin || false,
+        companyAccess: user.companyAccess || [],
+        companies: companies.map(c => ({
+          id: c._id,
+          name: c.name,
+          slug: c.slug,
+          logo: c.logo,
+          color: c.color
+        }))
       }
     });
   } catch (error) {
@@ -126,16 +214,44 @@ app.post('/api/auth/login', async (req, res) => {
 
 // Get current user (verify token)
 app.get('/api/auth/me', authMiddleware, async (req, res) => {
-  res.json({
-    success: true,
-    user: {
-      id: req.user._id,
-      username: req.user.username,
-      fullName: req.user.fullName,
-      role: req.user.role,
-      profileImage: req.user.profileImage
+  try {
+    // Get companies user can access
+    let companies = [];
+    if (req.user.isSuperAdmin) {
+      companies = await Company.find({ isActive: true }).select('name slug logo color');
+    } else if (req.user.companyAccess && req.user.companyAccess.length > 0) {
+      const companyIds = req.user.companyAccess.map(ca => ca.company);
+      companies = await Company.find({ _id: { $in: companyIds }, isActive: true }).select('name slug logo color');
+    } else {
+      const defaultCompany = await Company.findOne({ slug: config.DEFAULT_COMPANY_SLUG });
+      if (defaultCompany) {
+        companies = [defaultCompany];
+      }
     }
-  });
+    
+    res.json({
+      success: true,
+      user: {
+        id: req.user._id,
+        username: req.user.username,
+        fullName: req.user.fullName,
+        role: req.user.role,
+        profileImage: req.user.profileImage,
+        isSuperAdmin: req.user.isSuperAdmin || false,
+        companyAccess: req.user.companyAccess || [],
+        companies: companies.map(c => ({
+          id: c._id,
+          name: c.name,
+          slug: c.slug,
+          logo: c.logo,
+          color: c.color
+        }))
+      }
+    });
+  } catch (error) {
+    console.error('Get me error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
 });
 
 // Update current user's profile
@@ -197,7 +313,200 @@ app.post('/api/auth/logout', authMiddleware, async (req, res) => {
 
 // Health check
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    connections: getConnectionStatus()
+  });
+});
+
+// ============ COMPANY MANAGEMENT ROUTES ============
+
+// Get all companies (user sees only their companies, super admin sees all)
+app.get('/api/companies', authMiddleware, async (req, res) => {
+  try {
+    let companies;
+    
+    if (req.user.isSuperAdmin) {
+      // Super admin sees all companies
+      companies = await Company.find().sort({ name: 1 });
+    } else if (req.user.companyAccess && req.user.companyAccess.length > 0) {
+      // User sees only their assigned companies
+      const companyIds = req.user.companyAccess.map(ca => ca.company);
+      companies = await Company.find({ _id: { $in: companyIds }, isActive: true }).sort({ name: 1 });
+    } else {
+      // Legacy user - show default company
+      const defaultCompany = await Company.findOne({ slug: config.DEFAULT_COMPANY_SLUG });
+      companies = defaultCompany ? [defaultCompany] : [];
+    }
+    
+    res.json({
+      success: true,
+      companies
+    });
+  } catch (error) {
+    console.error('Get companies error:', error);
+    res.status(500).json({ message: 'Failed to get companies' });
+  }
+});
+
+// Get single company
+app.get('/api/companies/:id', authMiddleware, async (req, res) => {
+  try {
+    const company = await Company.findById(req.params.id);
+    if (!company) {
+      return res.status(404).json({ message: 'Company not found' });
+    }
+    
+    res.json({
+      success: true,
+      company
+    });
+  } catch (error) {
+    console.error('Get company error:', error);
+    res.status(500).json({ message: 'Failed to get company' });
+  }
+});
+
+// Create new company (Super admin only)
+app.post('/api/companies', authMiddleware, superAdminMiddleware, async (req, res) => {
+  try {
+    const { name, logo, color, description } = req.body;
+    
+    if (!name || !name.trim()) {
+      return res.status(400).json({ message: 'Company name is required' });
+    }
+    
+    // Auto-generate slug: shalset-{name}-{random5digits}
+    const namePart = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+    const randomPart = Math.floor(10000 + Math.random() * 90000); // 5 random digits
+    const companySlug = `shalset-${namePart}-${randomPart}`;
+    
+    // Check if slug already exists (very unlikely with random)
+    const existingCompany = await Company.findOne({ slug: companySlug });
+    if (existingCompany) {
+      return res.status(400).json({ message: 'Please try again - slug collision occurred' });
+    }
+    
+    const company = new Company({
+      name: name.trim(),
+      slug: companySlug,
+      logo: logo || '',
+      color: color || '#E53935',
+      description: description || '',
+      createdBy: req.user._id
+    });
+    
+    await company.save();
+    
+    // Initialize the company database by getting a connection
+    await getCompanyConnection(companySlug);
+    
+    res.status(201).json({
+      success: true,
+      message: 'Company created successfully',
+      company
+    });
+  } catch (error) {
+    console.error('Create company error:', error);
+    res.status(500).json({ message: 'Failed to create company' });
+  }
+});
+
+// Update company (Super admin only)
+app.put('/api/companies/:id', authMiddleware, superAdminMiddleware, async (req, res) => {
+  try {
+    const { name, logo, color, description, isActive } = req.body;
+    
+    const company = await Company.findById(req.params.id);
+    if (!company) {
+      return res.status(404).json({ message: 'Company not found' });
+    }
+    
+    // Update fields
+    if (name !== undefined) company.name = name.trim();
+    if (logo !== undefined) company.logo = logo;
+    if (color !== undefined) company.color = color;
+    if (description !== undefined) company.description = description;
+    if (isActive !== undefined) company.isActive = isActive;
+    // Note: slug cannot be changed as it's used as database name
+    
+    await company.save();
+    
+    res.json({
+      success: true,
+      message: 'Company updated successfully',
+      company
+    });
+  } catch (error) {
+    console.error('Update company error:', error);
+    res.status(500).json({ message: 'Failed to update company' });
+  }
+});
+
+// Delete company (Super admin only) - just deactivates, doesn't delete data
+app.delete('/api/companies/:id', authMiddleware, superAdminMiddleware, async (req, res) => {
+  try {
+    const company = await Company.findById(req.params.id);
+    if (!company) {
+      return res.status(404).json({ message: 'Company not found' });
+    }
+    
+    // Don't actually delete - just deactivate
+    company.isActive = false;
+    await company.save();
+    
+    res.json({
+      success: true,
+      message: 'Company deactivated successfully'
+    });
+  } catch (error) {
+    console.error('Delete company error:', error);
+    res.status(500).json({ message: 'Failed to delete company' });
+  }
+});
+
+// Assign company access to user (Admin only)
+app.put('/api/users/:id/company-access', authMiddleware, superAdminMiddleware, async (req, res) => {
+  try {
+    const { companyAccess } = req.body;
+    
+    const user = await User.findById(req.params.id);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    
+    // Validate and format company access
+    const formattedAccess = [];
+    for (const access of companyAccess) {
+      const company = await Company.findById(access.companyId || access.company);
+      if (company) {
+        formattedAccess.push({
+          company: company._id,
+          companySlug: company.slug,
+          companyName: company.name,
+          role: access.role || 'user'
+        });
+      }
+    }
+    
+    user.companyAccess = formattedAccess;
+    await user.save();
+    
+    res.json({
+      success: true,
+      message: 'Company access updated successfully',
+      user: {
+        id: user._id,
+        username: user.username,
+        fullName: user.fullName,
+        companyAccess: user.companyAccess
+      }
+    });
+  } catch (error) {
+    console.error('Update company access error:', error);
+    res.status(500).json({ message: 'Failed to update company access' });
+  }
 });
 
 // Seed endpoint - creates initial admin user (only if no users exist)
@@ -322,7 +631,7 @@ app.get('/api/users', authMiddleware, adminMiddleware, async (req, res) => {
 // Create new user (Admin only)
 app.post('/api/users', authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const { username, password, fullName, role } = req.body;
+    const { username, password, fullName, role, companyAccess, isSuperAdmin } = req.body;
     
     if (!username || !password || !fullName) {
       return res.status(400).json({ message: 'Username, password, and full name are required' });
@@ -334,11 +643,25 @@ app.post('/api/users', authMiddleware, adminMiddleware, async (req, res) => {
       return res.status(400).json({ message: 'Username already exists' });
     }
     
+    // Build company access array from company IDs
+    let companyAccessArray = [];
+    if (companyAccess && companyAccess.length > 0) {
+      const companies = await Company.find({ _id: { $in: companyAccess } });
+      companyAccessArray = companies.map(c => ({
+        company: c._id,
+        companySlug: c.slug,
+        companyName: c.name,
+        role: role || 'user'
+      }));
+    }
+    
     const user = new User({
       username: username.toLowerCase(),
       password,
       fullName,
-      role: role || 'user'
+      role: role || 'user',
+      isSuperAdmin: req.user.isSuperAdmin ? (isSuperAdmin || false) : false,
+      companyAccess: companyAccessArray
     });
     
     await user.save();
@@ -350,6 +673,8 @@ app.post('/api/users', authMiddleware, adminMiddleware, async (req, res) => {
         username: user.username,
         fullName: user.fullName,
         role: user.role,
+        isSuperAdmin: user.isSuperAdmin,
+        companyAccess: user.companyAccess,
         createdAt: user.createdAt
       }
     });
@@ -363,7 +688,7 @@ app.post('/api/users', authMiddleware, adminMiddleware, async (req, res) => {
 app.put('/api/users/:id', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
-    const { username, password, fullName, role } = req.body;
+    const { username, password, fullName, role, companyAccess, isSuperAdmin } = req.body;
     
     const user = await User.findById(id);
     if (!user) {
@@ -383,6 +708,26 @@ app.put('/api/users/:id', authMiddleware, adminMiddleware, async (req, res) => {
     if (role) user.role = role;
     if (password) user.password = password; // Will be hashed by pre-save hook
     
+    // Update company access if provided
+    if (companyAccess !== undefined) {
+      if (companyAccess.length > 0) {
+        const companies = await Company.find({ _id: { $in: companyAccess } });
+        user.companyAccess = companies.map(c => ({
+          company: c._id,
+          companySlug: c.slug,
+          companyName: c.name,
+          role: role || user.role
+        }));
+      } else {
+        user.companyAccess = [];
+      }
+    }
+    
+    // Only super admins can grant super admin status
+    if (req.user.isSuperAdmin && isSuperAdmin !== undefined) {
+      user.isSuperAdmin = isSuperAdmin;
+    }
+    
     await user.save();
     
     res.json({
@@ -392,6 +737,8 @@ app.put('/api/users/:id', authMiddleware, adminMiddleware, async (req, res) => {
         username: user.username,
         fullName: user.fullName,
         role: user.role,
+        isSuperAdmin: user.isSuperAdmin,
+        companyAccess: user.companyAccess,
         createdAt: user.createdAt,
         lastLogin: user.lastLogin
       }
@@ -432,7 +779,7 @@ app.delete('/api/users/:id', authMiddleware, adminMiddleware, async (req, res) =
 // ============ SCAN ROUTES ============
 
 // Save a new scan
-app.post('/api/scans', authMiddleware, async (req, res) => {
+app.post('/api/scans', authMiddleware, companyMiddleware, async (req, res) => {
   try {
     const { barcode, scanMode, deviceInfo, location } = req.body;
     
@@ -440,7 +787,7 @@ app.post('/api/scans', authMiddleware, async (req, res) => {
       return res.status(400).json({ message: 'Barcode data is required' });
     }
     
-    const scan = new Scan({
+    const scan = new req.Scan({
       barcode: barcode.trim(),
       user: req.user._id,
       username: req.user.username,
@@ -469,18 +816,18 @@ app.post('/api/scans', authMiddleware, async (req, res) => {
 });
 
 // Get scans for current user
-app.get('/api/scans/my', authMiddleware, async (req, res) => {
+app.get('/api/scans/my', authMiddleware, companyMiddleware, async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 50;
     const page = parseInt(req.query.page) || 1;
     const skip = (page - 1) * limit;
     
-    const scans = await Scan.find({ user: req.user._id })
+    const scans = await req.Scan.find({ user: req.user._id })
       .sort({ scannedAt: -1 })
       .skip(skip)
       .limit(limit);
     
-    const total = await Scan.countDocuments({ user: req.user._id });
+    const total = await req.Scan.countDocuments({ user: req.user._id });
     
     res.json({
       success: true,
@@ -499,18 +846,18 @@ app.get('/api/scans/my', authMiddleware, async (req, res) => {
 });
 
 // Get all scans (admin view)
-app.get('/api/scans/all', authMiddleware, async (req, res) => {
+app.get('/api/scans/all', authMiddleware, companyMiddleware, async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 100;
     const page = parseInt(req.query.page) || 1;
     const skip = (page - 1) * limit;
     
-    const scans = await Scan.find()
+    const scans = await req.Scan.find()
       .sort({ scannedAt: -1 })
       .skip(skip)
       .limit(limit);
     
-    const total = await Scan.countDocuments();
+    const total = await req.Scan.countDocuments();
     
     res.json({
       success: true,
@@ -529,19 +876,19 @@ app.get('/api/scans/all', authMiddleware, async (req, res) => {
 });
 
 // Get scan statistics
-app.get('/api/scans/stats', authMiddleware, async (req, res) => {
+app.get('/api/scans/stats', authMiddleware, companyMiddleware, async (req, res) => {
   try {
     const userId = req.query.userId || req.user._id;
     
-    const totalScans = await Scan.countDocuments({ user: userId });
+    const totalScans = await req.Scan.countDocuments({ user: userId });
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0);
-    const todayScans = await Scan.countDocuments({ 
+    const todayScans = await req.Scan.countDocuments({ 
       user: userId, 
       scannedAt: { $gte: todayStart } 
     });
     
-    const recentScans = await Scan.find({ user: userId })
+    const recentScans = await req.Scan.find({ user: userId })
       .sort({ scannedAt: -1 })
       .limit(5);
     
@@ -560,13 +907,13 @@ app.get('/api/scans/stats', authMiddleware, async (req, res) => {
 });
 
 // Delete scans older than X days
-app.delete('/api/scans/cleanup', authMiddleware, async (req, res) => {
+app.delete('/api/scans/cleanup', authMiddleware, companyMiddleware, async (req, res) => {
   try {
     const days = parseInt(req.query.days) || 3;
     const cutoffDate = new Date();
     cutoffDate.setDate(cutoffDate.getDate() - days);
     
-    const result = await Scan.deleteMany({
+    const result = await req.Scan.deleteMany({
       scannedAt: { $lt: cutoffDate }
     });
     
@@ -584,10 +931,10 @@ app.delete('/api/scans/cleanup', authMiddleware, async (req, res) => {
 // ============ PRODUCT/INVENTORY ROUTES ============
 
 // Check if product exists by barcode
-app.get('/api/products/check/:barcode', authMiddleware, async (req, res) => {
+app.get('/api/products/check/:barcode', authMiddleware, companyMiddleware, async (req, res) => {
   try {
     const { barcode } = req.params;
-    const product = await Product.findOne({ barcode: barcode.trim() });
+    const product = await req.Product.findOne({ barcode: barcode.trim() });
     
     if (product) {
       res.json({
@@ -617,7 +964,7 @@ app.get('/api/products/check/:barcode', authMiddleware, async (req, res) => {
 });
 
 // Create new product
-app.post('/api/products', authMiddleware, async (req, res) => {
+app.post('/api/products', authMiddleware, companyMiddleware, async (req, res) => {
   try {
     const { barcode, name, quantity, note, buyingPrice, sellingPrice, boughtFrom, sellLocation, category } = req.body;
     
@@ -626,7 +973,7 @@ app.post('/api/products', authMiddleware, async (req, res) => {
     }
     
     // Check if product already exists
-    const existingProduct = await Product.findOne({ barcode: barcode.trim() });
+    const existingProduct = await req.Product.findOne({ barcode: barcode.trim() });
     if (existingProduct) {
       return res.status(409).json({ message: 'Product with this barcode already exists' });
     }
@@ -636,10 +983,10 @@ app.post('/api/products', authMiddleware, async (req, res) => {
     // Get category info if provided
     let categoryDoc = null;
     if (category) {
-      categoryDoc = await Category.findById(category);
+      categoryDoc = await req.Category.findById(category);
     }
     
-    const product = new Product({
+    const product = new req.Product({
       barcode: barcode.trim(),
       name: name.trim(),
       currentStock: initialQuantity,
@@ -653,7 +1000,8 @@ app.post('/api/products', authMiddleware, async (req, res) => {
       stockHistory: initialQuantity > 0 ? [{
         quantity: initialQuantity,
         type: 'add',
-        note: 'Initial stock',
+        note: note || 'Initial stock',
+        supplier: boughtFrom?.trim() || '',
         addedBy: req.user._id,
         addedByName: req.user.fullName
       }] : [],
@@ -687,7 +1035,7 @@ app.post('/api/products', authMiddleware, async (req, res) => {
 });
 
 // Add stock to existing product
-app.post('/api/products/:barcode/add-stock', authMiddleware, async (req, res) => {
+app.post('/api/products/:barcode/add-stock', authMiddleware, companyMiddleware, async (req, res) => {
   try {
     const { barcode } = req.params;
     const { quantity, note, supplier } = req.body;
@@ -699,7 +1047,7 @@ app.post('/api/products/:barcode/add-stock', authMiddleware, async (req, res) =>
       return res.status(400).json({ message: 'Valid quantity is required' });
     }
     
-    const product = await Product.findOne({ barcode: barcode.trim() });
+    const product = await req.Product.findOne({ barcode: barcode.trim() });
     if (!product) {
       return res.status(404).json({ message: 'Product not found' });
     }
@@ -733,7 +1081,7 @@ app.post('/api/products/:barcode/add-stock', authMiddleware, async (req, res) =>
 });
 
 // Remove stock from product
-app.post('/api/products/:barcode/remove-stock', authMiddleware, async (req, res) => {
+app.post('/api/products/:barcode/remove-stock', authMiddleware, companyMiddleware, async (req, res) => {
   try {
     const { barcode } = req.params;
     const { quantity, note, location } = req.body;
@@ -745,7 +1093,7 @@ app.post('/api/products/:barcode/remove-stock', authMiddleware, async (req, res)
       return res.status(400).json({ message: 'Valid quantity is required' });
     }
     
-    const product = await Product.findOne({ barcode: barcode.trim() });
+    const product = await req.Product.findOne({ barcode: barcode.trim() });
     if (!product) {
       return res.status(404).json({ message: 'Product not found' });
     }
@@ -783,7 +1131,7 @@ app.post('/api/products/:barcode/remove-stock', authMiddleware, async (req, res)
 });
 
 // Get all products
-app.get('/api/products', authMiddleware, async (req, res) => {
+app.get('/api/products', authMiddleware, companyMiddleware, async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 100;
     const page = parseInt(req.query.page) || 1;
@@ -810,13 +1158,13 @@ app.get('/api/products', authMiddleware, async (req, res) => {
       }
     }
     
-    const products = await Product.find(query)
+    const products = await req.Product.find(query)
       .sort({ updatedAt: -1 })
       .skip(skip)
       .limit(limit)
       .select('-stockHistory');
     
-    const total = await Product.countDocuments(query);
+    const total = await req.Product.countDocuments(query);
     
     res.json({
       success: true,
@@ -835,10 +1183,10 @@ app.get('/api/products', authMiddleware, async (req, res) => {
 });
 
 // Get single product with history
-app.get('/api/products/:barcode', authMiddleware, async (req, res) => {
+app.get('/api/products/:barcode', authMiddleware, companyMiddleware, async (req, res) => {
   try {
     const { barcode } = req.params;
-    const product = await Product.findOne({ barcode: barcode.trim() });
+    const product = await req.Product.findOne({ barcode: barcode.trim() });
     
     if (!product) {
       return res.status(404).json({ message: 'Product not found' });
@@ -855,12 +1203,12 @@ app.get('/api/products/:barcode', authMiddleware, async (req, res) => {
 });
 
 // Update product info
-app.put('/api/products/:barcode', authMiddleware, async (req, res) => {
+app.put('/api/products/:barcode', authMiddleware, companyMiddleware, async (req, res) => {
   try {
     const { barcode } = req.params;
     const { name, note, buyingPrice, sellingPrice, boughtFrom, sellLocation, imageUrl, category } = req.body;
     
-    const product = await Product.findOne({ barcode: barcode.trim() });
+    const product = await req.Product.findOne({ barcode: barcode.trim() });
     if (!product) {
       return res.status(404).json({ message: 'Product not found' });
     }
@@ -880,7 +1228,7 @@ app.put('/api/products/:barcode', authMiddleware, async (req, res) => {
         product.category = null;
         product.categoryName = '';
       } else {
-        const categoryDoc = await Category.findById(category);
+        const categoryDoc = await req.Category.findById(category);
         if (categoryDoc) {
           product.category = categoryDoc._id;
           product.categoryName = categoryDoc.name;
@@ -902,16 +1250,16 @@ app.put('/api/products/:barcode', authMiddleware, async (req, res) => {
 });
 
 // Delete product
-app.delete('/api/products/:barcode', authMiddleware, async (req, res) => {
+app.delete('/api/products/:barcode', authMiddleware, companyMiddleware, async (req, res) => {
   try {
     const { barcode } = req.params;
     
-    const product = await Product.findOne({ barcode: barcode.trim() });
+    const product = await req.Product.findOne({ barcode: barcode.trim() });
     if (!product) {
       return res.status(404).json({ message: 'Product not found' });
     }
     
-    await Product.findByIdAndDelete(product._id);
+    await req.Product.findByIdAndDelete(product._id);
     
     res.json({
       success: true,
@@ -926,9 +1274,9 @@ app.delete('/api/products/:barcode', authMiddleware, async (req, res) => {
 // ============ CATEGORY ROUTES ============
 
 // Get all categories
-app.get('/api/categories', authMiddleware, async (req, res) => {
+app.get('/api/categories', authMiddleware, companyMiddleware, async (req, res) => {
   try {
-    const categories = await Category.find().sort({ name: 1 });
+    const categories = await req.Category.find().sort({ name: 1 });
     res.json({
       success: true,
       categories
@@ -940,7 +1288,7 @@ app.get('/api/categories', authMiddleware, async (req, res) => {
 });
 
 // Create new category
-app.post('/api/categories', authMiddleware, async (req, res) => {
+app.post('/api/categories', authMiddleware, companyMiddleware, async (req, res) => {
   try {
     const { name, description, color } = req.body;
     
@@ -949,12 +1297,12 @@ app.post('/api/categories', authMiddleware, async (req, res) => {
     }
     
     // Check if category already exists
-    const existingCategory = await Category.findOne({ name: name.trim() });
+    const existingCategory = await req.Category.findOne({ name: name.trim() });
     if (existingCategory) {
       return res.status(400).json({ message: 'Category already exists' });
     }
     
-    const category = new Category({
+    const category = new req.Category({
       name: name.trim(),
       description: description?.trim() || '',
       color: color || '#3b82f6',
@@ -976,26 +1324,26 @@ app.post('/api/categories', authMiddleware, async (req, res) => {
 });
 
 // Update category
-app.put('/api/categories/:id', authMiddleware, async (req, res) => {
+app.put('/api/categories/:id', authMiddleware, companyMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
     const { name, description, color } = req.body;
     
-    const category = await Category.findById(id);
+    const category = await req.Category.findById(id);
     if (!category) {
       return res.status(404).json({ message: 'Category not found' });
     }
     
     if (name !== undefined) {
       // Check if new name conflicts with existing category
-      const existingCategory = await Category.findOne({ name: name.trim(), _id: { $ne: id } });
+      const existingCategory = await req.Category.findOne({ name: name.trim(), _id: { $ne: id } });
       if (existingCategory) {
         return res.status(400).json({ message: 'Category name already exists' });
       }
       category.name = name.trim();
       
       // Update categoryName in all products with this category
-      await Product.updateMany({ category: id }, { categoryName: name.trim() });
+      await req.Product.updateMany({ category: id }, { categoryName: name.trim() });
     }
     if (description !== undefined) category.description = description.trim();
     if (color !== undefined) category.color = color;
@@ -1014,19 +1362,19 @@ app.put('/api/categories/:id', authMiddleware, async (req, res) => {
 });
 
 // Delete category
-app.delete('/api/categories/:id', authMiddleware, async (req, res) => {
+app.delete('/api/categories/:id', authMiddleware, companyMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
     
-    const category = await Category.findById(id);
+    const category = await req.Category.findById(id);
     if (!category) {
       return res.status(404).json({ message: 'Category not found' });
     }
     
     // Remove category reference from all products
-    await Product.updateMany({ category: id }, { category: null, categoryName: '' });
+    await req.Product.updateMany({ category: id }, { category: null, categoryName: '' });
     
-    await Category.findByIdAndDelete(id);
+    await req.Category.findByIdAndDelete(id);
     
     res.json({
       success: true,
@@ -1039,10 +1387,10 @@ app.delete('/api/categories/:id', authMiddleware, async (req, res) => {
 });
 
 // Get products count by category
-app.get('/api/categories/:id/products-count', authMiddleware, async (req, res) => {
+app.get('/api/categories/:id/products-count', authMiddleware, companyMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
-    const count = await Product.countDocuments({ category: id });
+    const count = await req.Product.countDocuments({ category: id });
     res.json({
       success: true,
       count
@@ -1056,14 +1404,14 @@ app.get('/api/categories/:id/products-count', authMiddleware, async (req, res) =
 // ============ STATISTICS ROUTES ============
 
 // Get category distribution for pie chart
-app.get('/api/stats/category-distribution', authMiddleware, async (req, res) => {
+app.get('/api/stats/category-distribution', authMiddleware, companyMiddleware, async (req, res) => {
   try {
-    const categories = await Category.find();
+    const categories = await req.Category.find();
     const distribution = [];
     
     // Get count for each category
     for (const category of categories) {
-      const count = await Product.countDocuments({ category: category._id });
+      const count = await req.Product.countDocuments({ category: category._id });
       if (count > 0) {
         distribution.push({
           name: category.name,
@@ -1074,7 +1422,7 @@ app.get('/api/stats/category-distribution', authMiddleware, async (req, res) => 
     }
     
     // Get uncategorized count
-    const uncategorizedCount = await Product.countDocuments({ category: null });
+    const uncategorizedCount = await req.Product.countDocuments({ category: null });
     if (uncategorizedCount > 0) {
       distribution.push({
         name: 'Uncategorized',
@@ -1094,9 +1442,9 @@ app.get('/api/stats/category-distribution', authMiddleware, async (req, res) => 
 });
 
 // Get dashboard stats
-app.get('/api/stats/dashboard', authMiddleware, async (req, res) => {
+app.get('/api/stats/dashboard', authMiddleware, companyMiddleware, async (req, res) => {
   try {
-    const products = await Product.find();
+    const products = await req.Product.find();
     
     // Calculate totals
     let totalProducts = products.length;
@@ -1126,7 +1474,7 @@ app.get('/api/stats/dashboard', authMiddleware, async (req, res) => {
 });
 
 // Get inventory value over time for line chart
-app.get('/api/stats/inventory-value', authMiddleware, async (req, res) => {
+app.get('/api/stats/inventory-value', authMiddleware, companyMiddleware, async (req, res) => {
   try {
     // Get days parameter (default 30)
     const days = parseInt(req.query.days) || 30;
@@ -1135,7 +1483,7 @@ app.get('/api/stats/inventory-value', authMiddleware, async (req, res) => {
     startDate.setHours(0, 0, 0, 0);
     
     // Get all products with stock history
-    const products = await Product.find();
+    const products = await req.Product.find();
     
     // Create a map of daily values
     const dailyData = new Map();
@@ -1193,7 +1541,7 @@ app.get('/api/stats/inventory-value', authMiddleware, async (req, res) => {
 });
 
 // Export inventory transactions (stock history)
-app.get('/api/export/inventory-transactions', authMiddleware, async (req, res) => {
+app.get('/api/export/inventory-transactions', authMiddleware, companyMiddleware, async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
     
@@ -1206,7 +1554,7 @@ app.get('/api/export/inventory-transactions', authMiddleware, async (req, res) =
     end.setHours(23, 59, 59, 999);
     
     // Get all products
-    const products = await Product.find().select('barcode name category categoryName buyingPrice sellingPrice stockHistory');
+    const products = await req.Product.find().select('barcode name category categoryName buyingPrice sellingPrice stockHistory');
     
     // Collect all transactions
     const transactions = [];
