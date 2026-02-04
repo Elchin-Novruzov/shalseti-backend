@@ -57,6 +57,11 @@ const productSchema = new mongoose.Schema({
     type: String,
     default: ''
   },
+  unit: {
+    type: String,
+    default: 'pcs',
+    trim: true
+  },
   category: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Category',
@@ -82,11 +87,25 @@ const productSchema = new mongoose.Schema({
     type: Date, 
     default: Date.now 
   }
+}, {
+  toJSON: {
+    transform: function(doc, ret) {
+      if (!ret.unit) ret.unit = 'pcs';
+      return ret;
+    }
+  },
+  toObject: {
+    transform: function(doc, ret) {
+      if (!ret.unit) ret.unit = 'pcs';
+      return ret;
+    }
+  }
 });
 
 // Update the updatedAt field before saving
 productSchema.pre('save', function(next) {
   this.updatedAt = new Date();
+  if (!this.unit) this.unit = 'pcs';
   next();
 });
 

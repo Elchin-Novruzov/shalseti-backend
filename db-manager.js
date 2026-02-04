@@ -73,6 +73,7 @@ function registerModels(connection) {
     boughtFrom: { type: String, default: '', trim: true },
     sellLocation: { type: String, default: '', trim: true },
     imageUrl: { type: String, default: '' },
+    unit: { type: String, default: 'pcs', trim: true },
     category: { type: mongoose.Schema.Types.ObjectId, ref: 'Category', default: null },
     categoryName: { type: String, default: '' },
     stockHistory: [stockHistorySchema],
@@ -80,10 +81,24 @@ function registerModels(connection) {
     createdByName: { type: String },
     createdAt: { type: Date, default: Date.now },
     updatedAt: { type: Date, default: Date.now }
+  }, {
+    toJSON: {
+      transform: function(doc, ret) {
+        if (!ret.unit) ret.unit = 'pcs';
+        return ret;
+      }
+    },
+    toObject: {
+      transform: function(doc, ret) {
+        if (!ret.unit) ret.unit = 'pcs';
+        return ret;
+      }
+    }
   });
 
   productSchema.pre('save', function(next) {
     this.updatedAt = new Date();
+    if (!this.unit) this.unit = 'pcs';
     next();
   });
 

@@ -966,7 +966,7 @@ app.get('/api/products/check/:barcode', authMiddleware, companyMiddleware, async
 // Create new product
 app.post('/api/products', authMiddleware, companyMiddleware, async (req, res) => {
   try {
-    const { barcode, name, quantity, note, buyingPrice, sellingPrice, boughtFrom, sellLocation, category } = req.body;
+    const { barcode, name, quantity, note, buyingPrice, sellingPrice, boughtFrom, sellLocation, category, unit } = req.body;
     
     if (!barcode || !name) {
       return res.status(400).json({ message: 'Barcode and name are required' });
@@ -995,6 +995,7 @@ app.post('/api/products', authMiddleware, companyMiddleware, async (req, res) =>
       sellingPrice: parseFloat(sellingPrice) || 0,
       boughtFrom: boughtFrom?.trim() || '',
       sellLocation: sellLocation?.trim() || '',
+      unit: unit?.trim() || 'pcs',
       category: categoryDoc ? categoryDoc._id : null,
       categoryName: categoryDoc ? categoryDoc.name : '',
       stockHistory: initialQuantity > 0 ? [{
@@ -1024,6 +1025,7 @@ app.post('/api/products', authMiddleware, companyMiddleware, async (req, res) =>
         sellingPrice: product.sellingPrice,
         boughtFrom: product.boughtFrom,
         sellLocation: product.sellLocation,
+        unit: product.unit,
         category: product.category,
         categoryName: product.categoryName
       }
@@ -1031,6 +1033,178 @@ app.post('/api/products', authMiddleware, companyMiddleware, async (req, res) =>
   } catch (error) {
     console.error('Create product error:', error);
     res.status(500).json({ message: 'Failed to create product' });
+  }
+});
+
+// Duplicate product
+app.post('/api/products/:barcode/duplicate', authMiddleware, companyMiddleware, async (req, res) => {
+  try {
+    const { barcode } = req.params;
+    
+    // Find original product
+    const originalProduct = await req.Product.findOne({ barcode: barcode.trim() });
+    if (!originalProduct) {
+      return res.status(404).json({ message: 'Product not found' });
+    }
+    
+    // Generate new barcode with (1), (2), etc. suffix
+    let newBarcode = `${barcode}(1)`;
+    let counter = 1;
+    
+    // Check if barcode with suffix already exists, increment counter until we find a free one
+    while (await req.Product.findOne({ barcode: newBarcode })) {
+      counter++;
+      newBarcode = `${barcode}(${counter})`;
+    }
+    
+    // Create duplicated product
+    const duplicatedProduct = new req.Product({
+      barcode: newBarcode,
+      name: originalProduct.name,
+      currentStock: originalProduct.currentStock,
+      note: originalProduct.note,
+      buyingPrice: originalProduct.buyingPrice,
+      sellingPrice: originalProduct.sellingPrice,
+      boughtFrom: originalProduct.boughtFrom,
+      sellLocation: originalProduct.sellLocation,
+      imageUrl: originalProduct.imageUrl,
+      unit: originalProduct.unit,
+      category: originalProduct.category,
+      categoryName: originalProduct.categoryName,
+      // Don't copy stockHistory, just add a "Duplicated" entry
+      stockHistory: originalProduct.currentStock > 0 ? [{
+        quantity: originalProduct.currentStock,
+        type: 'add',
+        note: `Duplicated from ${barcode}`,
+        supplier: '',
+        addedBy: req.user._id,
+        addedByName: req.user.fullName
+      }] : [],
+      createdBy: req.user._id,
+      createdByName: req.user.fullName
+    });
+    
+    await duplicatedProduct.save();
+    
+    res.status(201).json({
+      success: true,
+      message: 'Product duplicated successfully',
+      product: {
+        id: duplicatedProduct._id,
+        barcode: duplicatedProduct.barcode,
+        name: duplicatedProduct.name,
+        currentStock: duplicatedProduct.currentStock,
+        note: duplicatedProduct.note,
+        buyingPrice: duplicatedProduct.buyingPrice,
+        sellingPrice: duplicatedProduct.sellingPrice,
+        boughtFrom: duplicatedProduct.boughtFrom,
+        sellLocation: duplicatedProduct.sellLocation,
+        imageUrl: duplicatedProduct.imageUrl,
+        unit: duplicatedProduct.unit,
+        category: duplicatedProduct.category,
+        categoryName: duplicatedProduct.categoryName
+      }
+    });
+  } catch (error) {
+    console.error('Duplicate product error:', error);
+    res.status(500).json({ message: 'Failed to duplicate product' });
+  }
+});
+
+// Transfer product to another company
+app.post('/api/products/:barcode/transfer', authMiddleware, companyMiddleware, async (req, res) => {
+  try {
+    const { barcode } = req.params;
+    const { targetCompanySlug, keepOriginal } = req.body;
+    
+    if (!targetCompanySlug) {
+      return res.status(400).json({ message: 'Target company slug is required' });
+    }
+    
+    if (targetCompanySlug === req.companySlug) {
+      return res.status(400).json({ message: 'Cannot transfer to the same company' });
+    }
+    
+    // Check if user has access to target company (unless super admin)
+    if (!req.user.isSuperAdmin) {
+      const hasAccess = req.user.companyAccess?.some(ca => ca.companySlug === targetCompanySlug);
+      if (!hasAccess) {
+        return res.status(403).json({ message: 'No access to target company' });
+      }
+    }
+    
+    // Verify target company exists
+    const targetCompany = await Company.findOne({ slug: targetCompanySlug, isActive: true });
+    if (!targetCompany) {
+      return res.status(404).json({ message: 'Target company not found' });
+    }
+    
+    // Find source product
+    const sourceProduct = await req.Product.findOne({ barcode: barcode.trim() });
+    if (!sourceProduct) {
+      return res.status(404).json({ message: 'Product not found' });
+    }
+    
+    // Get target company database connection
+    const targetDb = await getCompanyConnection(targetCompanySlug);
+    const TargetProduct = targetDb.model('Product');
+    
+    // Check if barcode exists in target company
+    let targetBarcode = sourceProduct.barcode;
+    const existingInTarget = await TargetProduct.findOne({ barcode: targetBarcode });
+    if (existingInTarget) {
+      // Generate new barcode with suffix
+      let counter = 1;
+      targetBarcode = `${sourceProduct.barcode}(${counter})`;
+      while (await TargetProduct.findOne({ barcode: targetBarcode })) {
+        counter++;
+        targetBarcode = `${sourceProduct.barcode}(${counter})`;
+      }
+    }
+    
+    // Create product in target company
+    const transferredProduct = new TargetProduct({
+      barcode: targetBarcode,
+      name: sourceProduct.name,
+      currentStock: sourceProduct.currentStock,
+      note: sourceProduct.note,
+      buyingPrice: sourceProduct.buyingPrice,
+      sellingPrice: sourceProduct.sellingPrice,
+      boughtFrom: sourceProduct.boughtFrom,
+      sellLocation: sourceProduct.sellLocation,
+      imageUrl: sourceProduct.imageUrl,
+      unit: sourceProduct.unit,
+      category: null, // Categories are company-specific, don't transfer
+      categoryName: '',
+      stockHistory: [{
+        quantity: sourceProduct.currentStock,
+        type: 'add',
+        note: `Transferred from ${req.companySlug}`,
+        addedBy: req.user._id,
+        addedByName: req.user.fullName || req.user.username,
+        createdAt: new Date()
+      }]
+    });
+    
+    await transferredProduct.save();
+    
+    // Delete from source company if not keeping original
+    if (!keepOriginal) {
+      await req.Product.deleteOne({ barcode: barcode.trim() });
+    }
+    
+    res.json({
+      success: true,
+      message: keepOriginal ? 'Product copied to target company' : 'Product transferred to target company',
+      product: {
+        barcode: transferredProduct.barcode,
+        name: transferredProduct.name,
+        targetCompany: targetCompanySlug
+      }
+    });
+  } catch (error) {
+    console.error('Transfer product error:', error);
+    res.status(500).json({ message: 'Failed to transfer product' });
   }
 });
 
@@ -1206,11 +1380,20 @@ app.get('/api/products/:barcode', authMiddleware, companyMiddleware, async (req,
 app.put('/api/products/:barcode', authMiddleware, companyMiddleware, async (req, res) => {
   try {
     const { barcode } = req.params;
-    const { name, note, buyingPrice, sellingPrice, boughtFrom, sellLocation, imageUrl, category } = req.body;
+    const { name, note, buyingPrice, sellingPrice, boughtFrom, sellLocation, imageUrl, category, newBarcode, unit } = req.body;
     
     const product = await req.Product.findOne({ barcode: barcode.trim() });
     if (!product) {
       return res.status(404).json({ message: 'Product not found' });
+    }
+    
+    // Update barcode if provided and different
+    if (newBarcode !== undefined && newBarcode.trim() !== barcode.trim()) {
+      const existingProduct = await req.Product.findOne({ barcode: newBarcode.trim() });
+      if (existingProduct) {
+        return res.status(400).json({ message: 'A product with this barcode already exists' });
+      }
+      product.barcode = newBarcode.trim();
     }
     
     // Update fields if provided
@@ -1221,6 +1404,7 @@ app.put('/api/products/:barcode', authMiddleware, companyMiddleware, async (req,
     if (boughtFrom !== undefined) product.boughtFrom = boughtFrom.trim();
     if (sellLocation !== undefined) product.sellLocation = sellLocation.trim();
     if (imageUrl !== undefined) product.imageUrl = imageUrl;
+    if (unit !== undefined) product.unit = unit.trim() || 'pcs';
     
     // Update category
     if (category !== undefined) {
@@ -1541,9 +1725,9 @@ app.get('/api/stats/inventory-value', authMiddleware, companyMiddleware, async (
 });
 
 // Export inventory transactions (stock history)
-app.get('/api/export/inventory-transactions', authMiddleware, companyMiddleware, async (req, res) => {
+app.get('/api/export/inventory-transactions', authMiddleware, async (req, res) => {
   try {
-    const { startDate, endDate } = req.query;
+    const { startDate, endDate, allCompanies } = req.query;
     
     // Parse dates
     const start = startDate ? new Date(startDate) : new Date(0); // From beginning
@@ -1553,8 +1737,89 @@ app.get('/api/export/inventory-transactions', authMiddleware, companyMiddleware,
     start.setHours(0, 0, 0, 0);
     end.setHours(23, 59, 59, 999);
     
+    // If allCompanies is requested, only super admins can use it
+    if (allCompanies === 'true') {
+      if (!req.user.isSuperAdmin) {
+        return res.status(403).json({ message: 'Super admin access required for all companies export' });
+      }
+      
+      // Get all active companies
+      const companies = await Company.find({ isActive: true });
+      const allTransactions = [];
+      
+      for (const company of companies) {
+        try {
+          const companyDb = await getCompanyConnection(company.slug);
+          const ProductModel = companyDb.model('Product');
+          
+          const products = await ProductModel.find().select('barcode name category categoryName buyingPrice sellingPrice stockHistory');
+          
+          for (const product of products) {
+            if (!product.stockHistory || product.stockHistory.length === 0) continue;
+            
+            for (const history of product.stockHistory) {
+              const transactionDate = new Date(history.createdAt);
+              
+              if (transactionDate >= start && transactionDate <= end) {
+                allTransactions.push({
+                  date: transactionDate,
+                  barcode: product.barcode,
+                  productName: product.name,
+                  category: product.categoryName || 'Uncategorized',
+                  type: history.type,
+                  quantity: history.quantity,
+                  buyingPrice: product.buyingPrice || 0,
+                  sellingPrice: product.sellingPrice || 0,
+                  totalCost: history.type === 'add' ? (history.quantity * (product.buyingPrice || 0)) : 0,
+                  totalRevenue: history.type === 'remove' ? (history.quantity * (product.sellingPrice || 0)) : 0,
+                  supplier: history.supplier || '',
+                  location: history.location || '',
+                  note: history.note || '',
+                  addedBy: history.addedByName || 'Unknown',
+                  createdAt: history.createdAt,
+                  companyName: company.name,
+                  companySlug: company.slug
+                });
+              }
+            }
+          }
+        } catch (companyErr) {
+          console.error(`Error fetching from company ${company.slug}:`, companyErr);
+        }
+      }
+      
+      // Sort by date (newest first)
+      allTransactions.sort((a, b) => b.date - a.date);
+      
+      return res.json({
+        success: true,
+        data: allTransactions,
+        count: allTransactions.length,
+        dateRange: {
+          start: start.toISOString(),
+          end: end.toISOString()
+        }
+      });
+    }
+    
+    // Regular single-company export - apply company middleware manually
+    const companySlug = req.headers['x-company-slug'] || config.DEFAULT_COMPANY_SLUG;
+    
+    // Check user access
+    if (!req.user.isSuperAdmin) {
+      const hasAccess = req.user.companyAccess?.some(ca => ca.companySlug === companySlug);
+      const legacyAccess = !req.user.companyAccess || req.user.companyAccess.length === 0;
+      
+      if (!hasAccess && !legacyAccess) {
+        return res.status(403).json({ message: 'No access to this company' });
+      }
+    }
+    
+    const companyDb = await getCompanyConnection(companySlug);
+    const ProductModel = companyDb.model('Product');
+    
     // Get all products
-    const products = await req.Product.find().select('barcode name category categoryName buyingPrice sellingPrice stockHistory');
+    const products = await ProductModel.find().select('barcode name category categoryName buyingPrice sellingPrice stockHistory');
     
     // Collect all transactions
     const transactions = [];
