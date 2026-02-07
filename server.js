@@ -995,7 +995,7 @@ app.post('/api/products', authMiddleware, companyMiddleware, async (req, res) =>
       sellingPrice: parseFloat(sellingPrice) || 0,
       boughtFrom: boughtFrom?.trim() || '',
       sellLocation: sellLocation?.trim() || '',
-      unit: unit?.trim() || 'pcs',
+      unit: unit?.trim() || 'ədəd',
       category: categoryDoc ? categoryDoc._id : null,
       categoryName: categoryDoc ? categoryDoc.name : '',
       stockHistory: initialQuantity > 0 ? [{
@@ -1404,7 +1404,7 @@ app.put('/api/products/:barcode', authMiddleware, companyMiddleware, async (req,
     if (boughtFrom !== undefined) product.boughtFrom = boughtFrom.trim();
     if (sellLocation !== undefined) product.sellLocation = sellLocation.trim();
     if (imageUrl !== undefined) product.imageUrl = imageUrl;
-    if (unit !== undefined) product.unit = unit.trim() || 'pcs';
+    if (unit !== undefined) product.unit = unit.trim() || 'ədəd';
     
     // Update category
     if (category !== undefined) {
@@ -1582,6 +1582,70 @@ app.get('/api/categories/:id/products-count', authMiddleware, companyMiddleware,
   } catch (error) {
     console.error('Get products count error:', error);
     res.status(500).json({ message: 'Failed to get products count' });
+  }
+});
+
+// Copy categories to another company
+app.post('/api/categories/copy-to-company', authMiddleware, async (req, res) => {
+  try {
+    const { sourceCompanySlug, targetCompanySlug } = req.body;
+    
+    if (!sourceCompanySlug || !targetCompanySlug) {
+      return res.status(400).json({ message: 'Source and target company slugs are required' });
+    }
+    
+    if (sourceCompanySlug === targetCompanySlug) {
+      return res.status(400).json({ message: 'Source and target companies must be different' });
+    }
+    
+    // Get source company database connection
+    const sourceDb = await getCompanyConnection(sourceCompanySlug);
+    const SourceCategory = sourceDb.model('Category');
+    
+    // Get target company database connection
+    const targetDb = await getCompanyConnection(targetCompanySlug);
+    const TargetCategory = targetDb.model('Category');
+    
+    // Get all categories from source company
+    const sourceCategories = await SourceCategory.find();
+    
+    if (sourceCategories.length === 0) {
+      return res.status(404).json({ message: 'No categories found in source company' });
+    }
+    
+    let copiedCount = 0;
+    let skippedCount = 0;
+    
+    // Copy each category
+    for (const sourceCat of sourceCategories) {
+      // Check if category with same name already exists in target
+      const existingCategory = await TargetCategory.findOne({ name: sourceCat.name });
+      
+      if (!existingCategory) {
+        // Create new category in target company
+        await TargetCategory.create({
+          name: sourceCat.name,
+          description: sourceCat.description,
+          color: sourceCat.color,
+          createdBy: req.user._id,
+          createdByName: req.user.fullName
+        });
+        copiedCount++;
+      } else {
+        skippedCount++;
+      }
+    }
+    
+    res.json({
+      success: true,
+      message: `Copied ${copiedCount} categories, skipped ${skippedCount} (already exists)`,
+      copiedCount,
+      skippedCount
+    });
+    
+  } catch (error) {
+    console.error('Copy categories error:', error);
+    res.status(500).json({ message: 'Failed to copy categories' });
   }
 });
 
