@@ -1057,7 +1057,7 @@ app.post('/api/products/:barcode/duplicate', authMiddleware, companyMiddleware, 
       newBarcode = `${barcode}(${counter})`;
     }
     
-    // Create duplicated product
+    // Create duplicated product - copy all fields including stockHistory
     const duplicatedProduct = new req.Product({
       barcode: newBarcode,
       name: originalProduct.name,
@@ -1071,15 +1071,8 @@ app.post('/api/products/:barcode/duplicate', authMiddleware, companyMiddleware, 
       unit: originalProduct.unit,
       category: originalProduct.category,
       categoryName: originalProduct.categoryName,
-      // Don't copy stockHistory, just add a "Duplicated" entry
-      stockHistory: originalProduct.currentStock > 0 ? [{
-        quantity: originalProduct.currentStock,
-        type: 'add',
-        note: `Duplicated from ${barcode}`,
-        supplier: '',
-        addedBy: req.user._id,
-        addedByName: req.user.fullName
-      }] : [],
+      // Copy the entire stockHistory from original product
+      stockHistory: originalProduct.stockHistory ? JSON.parse(JSON.stringify(originalProduct.stockHistory)) : [],
       createdBy: req.user._id,
       createdByName: req.user.fullName
     });
