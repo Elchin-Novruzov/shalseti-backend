@@ -1058,6 +1058,21 @@ app.post('/api/products/:barcode/duplicate', authMiddleware, companyMiddleware, 
     }
     
     // Create duplicated product - copy all fields including stockHistory
+    const copiedStockHistory = originalProduct.stockHistory ? JSON.parse(JSON.stringify(originalProduct.stockHistory)) : [];
+    
+    // Add a note to the stock history about duplication
+    if (originalProduct.currentStock > 0) {
+      copiedStockHistory.push({
+        quantity: originalProduct.currentStock,
+        type: 'add',
+        note: `(Duplicated from ${barcode})`,
+        supplier: '',
+        addedBy: req.user._id,
+        addedByName: req.user.fullName,
+        createdAt: new Date()
+      });
+    }
+    
     const duplicatedProduct = new req.Product({
       barcode: newBarcode,
       name: originalProduct.name,
@@ -1071,8 +1086,8 @@ app.post('/api/products/:barcode/duplicate', authMiddleware, companyMiddleware, 
       unit: originalProduct.unit,
       category: originalProduct.category,
       categoryName: originalProduct.categoryName,
-      // Copy the entire stockHistory from original product
-      stockHistory: originalProduct.stockHistory ? JSON.parse(JSON.stringify(originalProduct.stockHistory)) : [],
+      // Copy the entire stockHistory from original product + add duplication note
+      stockHistory: copiedStockHistory,
       createdBy: req.user._id,
       createdByName: req.user.fullName
     });
@@ -1155,7 +1170,22 @@ app.post('/api/products/:barcode/transfer', authMiddleware, companyMiddleware, a
       }
     }
     
-    // Create product in target company
+    // Create product in target company - copy all fields including stockHistory
+    const copiedStockHistory = sourceProduct.stockHistory ? JSON.parse(JSON.stringify(sourceProduct.stockHistory)) : [];
+    
+    // Add a note to the stock history about transfer
+    if (sourceProduct.currentStock > 0) {
+      copiedStockHistory.push({
+        quantity: sourceProduct.currentStock,
+        type: 'add',
+        note: `(Transferred from ${req.companySlug})`,
+        supplier: '',
+        addedBy: req.user._id,
+        addedByName: req.user.fullName || req.user.username,
+        createdAt: new Date()
+      });
+    }
+    
     const transferredProduct = new TargetProduct({
       barcode: targetBarcode,
       name: sourceProduct.name,
@@ -1169,14 +1199,10 @@ app.post('/api/products/:barcode/transfer', authMiddleware, companyMiddleware, a
       unit: sourceProduct.unit,
       category: null, // Categories are company-specific, don't transfer
       categoryName: '',
-      stockHistory: [{
-        quantity: sourceProduct.currentStock,
-        type: 'add',
-        note: `Transferred from ${req.companySlug}`,
-        addedBy: req.user._id,
-        addedByName: req.user.fullName || req.user.username,
-        createdAt: new Date()
-      }]
+      // Copy the entire stockHistory from source product + add transfer note
+      stockHistory: copiedStockHistory,
+      createdBy: req.user._id,
+      createdByName: req.user.fullName || req.user.username
     });
     
     await transferredProduct.save();
