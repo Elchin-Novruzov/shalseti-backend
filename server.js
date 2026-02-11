@@ -1084,7 +1084,7 @@ app.post('/api/products/:barcode/duplicate', authMiddleware, companyMiddleware, 
       sellLocation: originalProduct.sellLocation,
       imageUrl: originalProduct.imageUrl,
       unit: originalProduct.unit,
-      category: originalProduct.category,
+      category: originalProduct.category, // Keep the same category (same company)
       categoryName: originalProduct.categoryName,
       // Copy the entire stockHistory from original product + add duplication note
       stockHistory: copiedStockHistory,
@@ -1156,6 +1156,20 @@ app.post('/api/products/:barcode/transfer', authMiddleware, companyMiddleware, a
     // Get target company database connection
     const targetDb = await getCompanyConnection(targetCompanySlug);
     const TargetProduct = targetDb.model('Product');
+    const TargetCategory = targetDb.model('Category');
+    
+    // Try to find matching category in target company by name
+    let targetCategory = null;
+    let targetCategoryName = '';
+    if (sourceProduct.categoryName) {
+      targetCategory = await TargetCategory.findOne({ name: sourceProduct.categoryName });
+      if (targetCategory) {
+        targetCategoryName = targetCategory.name;
+      } else {
+        // Category doesn't exist in target, keep the name but no ID
+        targetCategoryName = sourceProduct.categoryName;
+      }
+    }
     
     // Check if barcode exists in target company
     let targetBarcode = sourceProduct.barcode;
@@ -1197,8 +1211,8 @@ app.post('/api/products/:barcode/transfer', authMiddleware, companyMiddleware, a
       sellLocation: sourceProduct.sellLocation,
       imageUrl: sourceProduct.imageUrl,
       unit: sourceProduct.unit,
-      category: null, // Categories are company-specific, don't transfer
-      categoryName: '',
+      category: targetCategory ? targetCategory._id : null, // Use matched category ID if found
+      categoryName: targetCategoryName, // Keep category name
       // Copy the entire stockHistory from source product + add transfer note
       stockHistory: copiedStockHistory,
       createdBy: req.user._id,
