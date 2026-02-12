@@ -1060,24 +1060,11 @@ app.post('/api/products/:barcode/duplicate', authMiddleware, companyMiddleware, 
     // Create duplicated product - copy all fields including stockHistory
     const copiedStockHistory = originalProduct.stockHistory ? JSON.parse(JSON.stringify(originalProduct.stockHistory)) : [];
     
-    // Add a note to the stock history about duplication
-    if (originalProduct.currentStock > 0) {
-      copiedStockHistory.push({
-        quantity: originalProduct.currentStock,
-        type: 'add',
-        note: `(Duplicated from ${barcode})`,
-        supplier: '',
-        addedBy: req.user._id,
-        addedByName: req.user.fullName,
-        createdAt: new Date()
-      });
-    }
-    
     const duplicatedProduct = new req.Product({
       barcode: newBarcode,
       name: originalProduct.name,
       currentStock: originalProduct.currentStock,
-      note: originalProduct.note,
+      note: originalProduct.note, // Keep original note as-is
       buyingPrice: originalProduct.buyingPrice,
       sellingPrice: originalProduct.sellingPrice,
       boughtFrom: originalProduct.boughtFrom,
@@ -1086,7 +1073,7 @@ app.post('/api/products/:barcode/duplicate', authMiddleware, companyMiddleware, 
       unit: originalProduct.unit,
       category: originalProduct.category, // Keep the same category (same company)
       categoryName: originalProduct.categoryName,
-      // Copy the entire stockHistory from original product + add duplication note
+      // Copy the entire stockHistory from original product as-is
       stockHistory: copiedStockHistory,
       createdBy: req.user._id,
       createdByName: req.user.fullName
@@ -1187,24 +1174,11 @@ app.post('/api/products/:barcode/transfer', authMiddleware, companyMiddleware, a
     // Create product in target company - copy all fields including stockHistory
     const copiedStockHistory = sourceProduct.stockHistory ? JSON.parse(JSON.stringify(sourceProduct.stockHistory)) : [];
     
-    // Add a note to the stock history about transfer
-    if (sourceProduct.currentStock > 0) {
-      copiedStockHistory.push({
-        quantity: sourceProduct.currentStock,
-        type: 'add',
-        note: `(Transferred from ${req.companySlug})`,
-        supplier: '',
-        addedBy: req.user._id,
-        addedByName: req.user.fullName || req.user.username,
-        createdAt: new Date()
-      });
-    }
-    
     const transferredProduct = new TargetProduct({
       barcode: targetBarcode,
       name: sourceProduct.name,
       currentStock: sourceProduct.currentStock,
-      note: sourceProduct.note,
+      note: sourceProduct.note, // Keep original note as-is
       buyingPrice: sourceProduct.buyingPrice,
       sellingPrice: sourceProduct.sellingPrice,
       boughtFrom: sourceProduct.boughtFrom,
@@ -1213,7 +1187,7 @@ app.post('/api/products/:barcode/transfer', authMiddleware, companyMiddleware, a
       unit: sourceProduct.unit,
       category: targetCategory ? targetCategory._id : null, // Use matched category ID if found
       categoryName: targetCategoryName, // Keep category name
-      // Copy the entire stockHistory from source product + add transfer note
+      // Copy the entire stockHistory from source product as-is
       stockHistory: copiedStockHistory,
       createdBy: req.user._id,
       createdByName: req.user.fullName || req.user.username
@@ -1334,6 +1308,46 @@ app.post('/api/products/:barcode/remove-stock', authMiddleware, companyMiddlewar
   } catch (error) {
     console.error('Remove stock error:', error);
     res.status(500).json({ message: 'Failed to remove stock' });
+  }
+});
+
+// Update stock history note (admin only)
+app.patch('/api/products/:barcode/stock-history/:index', authMiddleware, companyMiddleware, async (req, res) => {
+  try {
+    // Only allow admin or super admin
+    if (req.user.role !== 'admin' && !req.user.isSuperAdmin) {
+      return res.status(403).json({ message: 'Only admins can edit stock history' });
+    }
+    
+    const { barcode, index } = req.params;
+    const { note } = req.body;
+    
+    const product = await req.Product.findOne({ barcode: barcode.trim() });
+    if (!product) {
+      return res.status(404).json({ message: 'Product not found' });
+    }
+    
+    const historyIndex = parseInt(index);
+    if (isNaN(historyIndex) || historyIndex < 0 || historyIndex >= product.stockHistory.length) {
+      return res.status(400).json({ message: 'Invalid history index' });
+    }
+    
+    // Update the note
+    product.stockHistory[historyIndex].note = note || '';
+    await product.save();
+    
+    res.json({
+      success: true,
+      message: 'Stock history note updated successfully',
+      product: {
+        id: product._id,
+        barcode: product.barcode,
+        stockHistory: product.stockHistory
+      }
+    });
+  } catch (error) {
+    console.error('Update stock history error:', error);
+    res.status(500).json({ message: 'Failed to update stock history note' });
   }
 });
 
