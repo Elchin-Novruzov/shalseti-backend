@@ -1357,6 +1357,54 @@ app.patch('/api/products/:barcode/stock-history/:index', authMiddleware, company
   }
 });
 
+// Delete stock history entry (admin only)
+app.delete('/api/products/:barcode/stock-history/:index', authMiddleware, companyMiddleware, async (req, res) => {
+  try {
+    // Only allow admin or super admin
+    if (req.user.role !== 'admin' && !req.user.isSuperAdmin) {
+      return res.status(403).json({ message: 'Only admins can delete stock history' });
+    }
+    
+    const { barcode, index } = req.params;
+    
+    const product = await req.Product.findOne({ barcode: barcode.trim() });
+    if (!product) {
+      return res.status(404).json({ message: 'Product not found' });
+    }
+    
+    const historyIndex = parseInt(index);
+    if (isNaN(historyIndex) || historyIndex < 0 || historyIndex >= product.stockHistory.length) {
+      return res.status(400).json({ message: 'Invalid history index' });
+    }
+    
+    // Get the entry to adjust stock
+    const entry = product.stockHistory[historyIndex];
+    const quantityChange = entry.type === 'add' ? -entry.quantity : entry.quantity;
+    
+    // Adjust current stock
+    product.currentStock = Math.max(0, product.currentStock + quantityChange);
+    
+    // Remove the entry from history
+    product.stockHistory.splice(historyIndex, 1);
+    
+    await product.save();
+    
+    res.json({
+      success: true,
+      message: 'Stock history entry deleted successfully',
+      product: {
+        id: product._id,
+        barcode: product.barcode,
+        currentStock: product.currentStock,
+        stockHistory: product.stockHistory
+      }
+    });
+  } catch (error) {
+    console.error('Delete stock history error:', error);
+    res.status(500).json({ message: 'Failed to delete stock history entry' });
+  }
+});
+
 // Get all products
 app.get('/api/products', authMiddleware, companyMiddleware, async (req, res) => {
   try {
