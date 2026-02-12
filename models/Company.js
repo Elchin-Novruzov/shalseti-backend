@@ -26,6 +26,16 @@ const companySchema = new mongoose.Schema({
     type: String,
     default: ''
   },
+  documentName: {
+    type: String,
+    default: 'Forma 013',
+    trim: true
+  },
+  documentNo: {
+    type: String,
+    default: 'SHAL-ANB-F-038-13',
+    trim: true
+  },
   isActive: {
     type: Boolean,
     default: true

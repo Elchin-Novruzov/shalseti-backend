@@ -218,10 +218,10 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
     // Get companies user can access
     let companies = [];
     if (req.user.isSuperAdmin) {
-      companies = await Company.find({ isActive: true }).select('name slug logo color');
+      companies = await Company.find({ isActive: true }).select('name slug logo color documentName documentNo');
     } else if (req.user.companyAccess && req.user.companyAccess.length > 0) {
       const companyIds = req.user.companyAccess.map(ca => ca.company);
-      companies = await Company.find({ _id: { $in: companyIds }, isActive: true }).select('name slug logo color');
+      companies = await Company.find({ _id: { $in: companyIds }, isActive: true }).select('name slug logo color documentName documentNo');
     } else {
       const defaultCompany = await Company.findOne({ slug: config.DEFAULT_COMPANY_SLUG });
       if (defaultCompany) {
@@ -244,7 +244,9 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
           name: c.name,
           slug: c.slug,
           logo: c.logo,
-          color: c.color
+          color: c.color,
+          documentName: c.documentName || 'Forma 013',
+          documentNo: c.documentNo || 'SHAL-ANB-F-038-13'
         }))
       }
     });
@@ -416,7 +418,7 @@ app.post('/api/companies', authMiddleware, superAdminMiddleware, async (req, res
 // Update company (Super admin only)
 app.put('/api/companies/:id', authMiddleware, superAdminMiddleware, async (req, res) => {
   try {
-    const { name, logo, color, description, isActive } = req.body;
+    const { name, logo, color, description, documentName, documentNo, isActive } = req.body;
     
     const company = await Company.findById(req.params.id);
     if (!company) {
@@ -428,6 +430,8 @@ app.put('/api/companies/:id', authMiddleware, superAdminMiddleware, async (req, 
     if (logo !== undefined) company.logo = logo;
     if (color !== undefined) company.color = color;
     if (description !== undefined) company.description = description;
+    if (documentName !== undefined) company.documentName = documentName.trim();
+    if (documentNo !== undefined) company.documentNo = documentNo.trim();
     if (isActive !== undefined) company.isActive = isActive;
     // Note: slug cannot be changed as it's used as database name
     
@@ -1238,7 +1242,8 @@ app.post('/api/products/:barcode/add-stock', authMiddleware, companyMiddleware, 
       quantity: addQuantity,
       type: 'add',
       note: note || '',
-      supplier: supplier?.trim() || '',
+      // Use provided supplier or fall back to product's default supplier
+      supplier: supplier?.trim() || product.boughtFrom || '',
       addedBy: req.user._id,
       addedByName: req.user.fullName
     });
@@ -1288,7 +1293,8 @@ app.post('/api/products/:barcode/remove-stock', authMiddleware, companyMiddlewar
       quantity: removeQuantity,
       type: 'remove',
       note: note || '',
-      location: location?.trim() || '',
+      // Use provided location or fall back to product's default sell location
+      location: location?.trim() || product.sellLocation || '',
       addedBy: req.user._id,
       addedByName: req.user.fullName
     });
