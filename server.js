@@ -1917,7 +1917,7 @@ app.get('/api/export/inventory-transactions', authMiddleware, async (req, res) =
           const companyDb = await getCompanyConnection(company.slug);
           const ProductModel = companyDb.model('Product');
           
-          const products = await ProductModel.find().select('barcode name category categoryName buyingPrice sellingPrice stockHistory');
+          const products = await ProductModel.find().select('barcode name category categoryName buyingPrice sellingPrice unit stockHistory');
           
           for (const product of products) {
             if (!product.stockHistory || product.stockHistory.length === 0) continue;
@@ -1933,6 +1933,7 @@ app.get('/api/export/inventory-transactions', authMiddleware, async (req, res) =
                   category: product.categoryName || 'Uncategorized',
                   type: history.type,
                   quantity: history.quantity,
+                  unit: product.unit || 'ədəd',
                   buyingPrice: product.buyingPrice || 0,
                   sellingPrice: product.sellingPrice || 0,
                   totalCost: history.type === 'add' ? (history.quantity * (product.buyingPrice || 0)) : 0,
@@ -1984,7 +1985,7 @@ app.get('/api/export/inventory-transactions', authMiddleware, async (req, res) =
     const ProductModel = companyDb.model('Product');
     
     // Get all products
-    const products = await ProductModel.find().select('barcode name category categoryName buyingPrice sellingPrice stockHistory');
+    const products = await ProductModel.find().select('barcode name category categoryName buyingPrice sellingPrice unit stockHistory');
     
     // Collect all transactions
     const transactions = [];
@@ -2004,6 +2005,7 @@ app.get('/api/export/inventory-transactions', authMiddleware, async (req, res) =
             category: product.categoryName || 'Uncategorized',
             type: history.type,
             quantity: history.quantity,
+            unit: product.unit || 'ədəd',
             buyingPrice: product.buyingPrice || 0,
             sellingPrice: product.sellingPrice || 0,
             totalCost: history.type === 'add' ? (history.quantity * (product.buyingPrice || 0)) : 0,
